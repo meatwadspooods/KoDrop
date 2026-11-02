@@ -18,7 +18,7 @@ cat > "$app/Contents/Info.plist" <<'EOF'
 <dict>
   <key>CFBundleExecutable</key><string>kodrop</string>
   <key>CFBundleIconFile</key><string>KoDrop</string>
-  <key>CFBundleIdentifier</key><string>com.adam.kodrop</string>
+  <key>CFBundleIdentifier</key><string>app.kodrop</string>
   <key>CFBundleName</key><string>KoDrop</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
@@ -28,5 +28,5 @@ cat > "$app/Contents/Info.plist" <<'EOF'
 </plist>
 EOF
 # Gives macOS a bundle identity to attach the Local Network permission to
-codesign --force --sign - --identifier com.adam.kodrop "$app"
+codesign --force --sign - --identifier app.kodrop "$app"
 echo "Built $app"

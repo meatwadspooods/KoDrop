@@ -165,13 +165,20 @@ fn is_book(path: &Path) -> bool {
 // Limits: the same filename overwrites and an interrupted copy can leave a partial file.
 // Uploading to a temp name and renaming over ssh would fix both
 fn send(path: &Path, host: &str) -> Result<(), String> {
-    let output = Command::new("/usr/bin/scp")
+    run(Command::new("/usr/bin/ssh")
+        .args(["-p", PORT])
+        .args(SSH_OPTIONS)
+        .arg(format!("root@{host}"))
+        .arg(format!("mkdir -p {DESTINATION}")))?;
+    run(Command::new("/usr/bin/scp")
         .args(["-O", "-P", PORT])
         .args(SSH_OPTIONS)
         .arg(path)
-        .arg(format!("root@{host}:{DESTINATION}"))
-        .output()
-        .map_err(|e| e.to_string())?;
+        .arg(format!("root@{host}:{DESTINATION}")))
+}
+
+fn run(command: &mut Command) -> Result<(), String> {
+    let output = command.output().map_err(|e| e.to_string())?;
     if output.status.success() {
         return Ok(());
     }
@@ -559,7 +566,7 @@ impl KoDrop {
         self.draw_kindle(&painter, kindle, incoming);
 
         let mut y = kindle.bottom() + 18.0;
-        y += draw_text(&painter, pos2(inner.left(), y), "Kindle Paperwhite", bold(17.0), INK, inner.width(), 1);
+        y += draw_text(&painter, pos2(inner.left(), y), "Kindle", bold(17.0), INK, inner.width(), 1);
         y += 6.0;
         let (label, color, reason) = match &self.connection {
             Connection::Connecting => ("Connecting…", MUTED, None),
