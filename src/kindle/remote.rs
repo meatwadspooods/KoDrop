@@ -1,4 +1,5 @@
 use super::library::{DEVICE_SCRIPT, Device, parse_device};
+use std::fs::File;
 use std::path::Path;
 use std::process::Command;
 
@@ -30,13 +31,25 @@ fn remote_dir(folder: &str) -> String {
 
 // Limits: the same filename overwrites and an interrupted copy can leave a partial file.
 // Uploading to a temp name and renaming over ssh would fix both
+// Uses cat over ssh because the Kindle's scp can't be trusted with paths: quotes, ~ and @ drop
+// the connection, and & reports success without putting the file where it was asked to go
 pub fn send(path: &Path, host: &str, folder: &str) -> Result<(), String> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| "That isn't a file".to_string())?
+        .to_string_lossy();
+    let file = File::open(path).map_err(|e| e.to_string())?;
     create_folder(host, folder)?;
-    run(Command::new("/usr/bin/scp")
-        .args(["-O", "-P", PORT])
+    run(Command::new("/usr/bin/ssh")
+        .args(["-p", PORT])
         .args(SSH_OPTIONS)
-        .arg(path)
-        .arg(format!("root@{host}:{}", shell_quote(&remote_dir(folder)))))
+        .arg(format!("root@{host}"))
+        .arg(upload_command(folder, &name))
+        .stdin(file))
+}
+
+fn upload_command(folder: &str, name: &str) -> String {
+    format!("cat > {}", shell_quote(&format!("{}{name}", remote_dir(folder))))
 }
 
 pub fn create_folder(host: &str, folder: &str) -> Result<(), String> {
@@ -69,7 +82,7 @@ pub fn fetch_device(host: &str) -> Result<Device, String> {
     Err(error_message(&String::from_utf8_lossy(&output.stderr)))
 }
 
-// scp ends with a generic "lost connection", the real cause is on the lines before it
+// A dropped connection ends with a generic "lost connection", the real cause is on the lines before it
 fn error_message(stderr: &str) -> String {
     let lines: Vec<&str> = stderr
         .lines()
@@ -99,6 +112,21 @@ mod tests {
         assert_eq!(shell_quote("My Book's; rm -rf x"), "'My Book'\\''s; rm -rf x'");
         assert_eq!(remote_dir(""), "/mnt/us/books/");
         assert_eq!(remote_dir("Fiction/Classics"), "/mnt/us/books/Fiction/Classics/");
+    }
+
+    #[test]
+    fn uploads_to_a_quoted_path() {
+        assert_eq!(upload_command("", "Book.epub"), "cat > '/mnt/us/books/Book.epub'");
+        assert_eq!(
+            upload_command("Sci-Fi & Fantasy", "Adam's ~Book @1.epub"),
+            "cat > '/mnt/us/books/Sci-Fi & Fantasy/Adam'\\''s ~Book @1.epub'"
+        );
+    }
+
+    #[test]
+    fn reports_a_missing_file_before_connecting() {
+        let error = send(Path::new("/nonexistent/Book.epub"), "127.0.0.1", "").unwrap_err();
+        assert!(error.contains("No such file"), "{error}");
     }
 
     #[test]
