@@ -2,7 +2,7 @@
 
 A small macOS app that sends books to a Kindle running KOReader over Wi-Fi. Drag a file onto the window or click to pick one. It also lists the books on your Kindle with your reading progress.
 
-Books go to `/mnt/us/books`, which KoDrop creates if needed.
+Books go to `/mnt/us/books` or a folder inside it. Pick one from the Folder menu or create a new one there. KoDrop creates `/mnt/us/books` if needed.
 
 ## Setup
 

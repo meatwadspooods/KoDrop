@@ -36,7 +36,14 @@ const DEVICE_SCRIPT: &str = r#"
 printf 'battery\t%s\n' "$(gasgauge-info -c 2>/dev/null | tr -d '%')"
 df -k /mnt/us | tail -n 1 | awk '{printf "storage\t%s\t%s\n",$3,$4}'
 printf 'koreader\t%s\n' "$(cat /mnt/us/koreader/git-rev 2>/dev/null)"
-for f in /mnt/us/books/*; do
+root=/mnt/us/books
+find "$root" \( -name '*.sdr' -o -name '.*' \) -prune -o -print 2>/dev/null | while IFS= read -r f; do
+  rel="${f#$root}"
+  rel="${rel#/}"
+  if [ -d "$f" ]; then
+    [ -n "$rel" ] && printf 'folder\t%s\n' "$rel"
+    continue
+  fi
   [ -f "$f" ] || continue
   sdr="${f%.*}.sdr"
   p=none
@@ -45,7 +52,7 @@ for f in /mnt/us/books/*; do
     v=$(grep -h percent_finished "$sdr"/metadata.*.lua 2>/dev/null | head -n 1 | sed 's/.*= *//; s/,.*//')
     [ -n "$v" ] && p=$v
   fi
-  printf 'book\t%s\t%s\t%s\t%s\n' "${f##*/}" "$(stat -c %s "$f")" "$(stat -c %Y "$f")" "$p"
+  printf 'book\t%s\t%s\t%s\t%s\n' "$rel" "$(stat -c %s "$f")" "$(stat -c %Y "$f")" "$p"
 done
 "#;
 
@@ -85,6 +92,7 @@ enum Progress {
 
 #[derive(Debug, PartialEq)]
 struct Book {
+    folder: String,
     file: String,
     title: String,
     author: String,
@@ -96,6 +104,7 @@ struct Book {
 #[derive(Debug, Default, PartialEq)]
 struct Device {
     books: Vec<Book>,
+    folders: Vec<String>,
     battery: Option<u8>,
     used_kb: u64,
     free_kb: u64,
@@ -116,16 +125,21 @@ enum Status {
 
 struct Item {
     name: String,
+    folder: String,
     status: Status,
 }
 
 enum Message {
     SendDone(usize, Status),
     Refreshed(Result<Device, String>),
+    FolderCreated(String, Result<(), String>),
 }
 
 struct KoDrop {
     host: String,
+    // Relative to DESTINATION, empty means the books folder itself
+    folder: String,
+    new_folder: Option<String>,
     items: Vec<Item>,
     device: Option<Device>,
     connection: Connection,
@@ -136,24 +150,58 @@ struct KoDrop {
     messages_tx: Sender<Message>,
 }
 
-fn config_path() -> Option<PathBuf> {
+fn config_path(name: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/kodrop/host"))
+    Some(PathBuf::from(home).join("Library/Application Support/kodrop").join(name))
 }
 
-fn load_host() -> String {
-    config_path()
+fn load_setting(name: &str) -> String {
+    config_path(name)
         .and_then(|path| fs::read_to_string(path).ok())
-        .map(|host| host.trim().to_string())
+        .map(|value| value.trim().to_string())
         .unwrap_or_default()
 }
 
-fn save_host(host: &str) {
-    let Some(path) = config_path() else { return };
+fn save_setting(name: &str, value: &str) {
+    let Some(path) = config_path(name) else { return };
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let _ = fs::write(path, host);
+    let _ = fs::write(path, value);
+}
+
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn remote_dir(folder: &str) -> String {
+    if folder.is_empty() {
+        DESTINATION.to_string()
+    } else {
+        format!("{DESTINATION}{folder}/")
+    }
+}
+
+fn folder_label(folder: &str) -> &str {
+    if folder.is_empty() { "books" } else { folder }
+}
+
+// The Kindle's storage is FAT-style, so this also rejects the characters it can't store
+fn valid_folder_name(name: &str) -> Result<(), &'static str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Enter a folder name");
+    }
+    if name.starts_with('.') {
+        return Err("Folder names can't start with a dot");
+    }
+    if name.len() > 255 {
+        return Err("That name is too long");
+    }
+    if name.chars().any(|c| c.is_control() || "/\\:*?\"<>|".contains(c)) {
+        return Err("Folder names can't contain / \\ : * ? \" < > |");
+    }
+    Ok(())
 }
 
 fn is_book(path: &Path) -> bool {
@@ -164,17 +212,21 @@ fn is_book(path: &Path) -> bool {
 
 // Limits: the same filename overwrites and an interrupted copy can leave a partial file.
 // Uploading to a temp name and renaming over ssh would fix both
-fn send(path: &Path, host: &str) -> Result<(), String> {
-    run(Command::new("/usr/bin/ssh")
-        .args(["-p", PORT])
-        .args(SSH_OPTIONS)
-        .arg(format!("root@{host}"))
-        .arg(format!("mkdir -p {DESTINATION}")))?;
+fn send(path: &Path, host: &str, folder: &str) -> Result<(), String> {
+    create_folder(host, folder)?;
     run(Command::new("/usr/bin/scp")
         .args(["-O", "-P", PORT])
         .args(SSH_OPTIONS)
         .arg(path)
-        .arg(format!("root@{host}:{DESTINATION}")))
+        .arg(format!("root@{host}:{}", shell_quote(&remote_dir(folder)))))
+}
+
+fn create_folder(host: &str, folder: &str) -> Result<(), String> {
+    run(Command::new("/usr/bin/ssh")
+        .args(["-p", PORT])
+        .args(SSH_OPTIONS)
+        .arg(format!("root@{host}"))
+        .arg(format!("mkdir -p {}", shell_quote(&remote_dir(folder)))))
 }
 
 fn run(command: &mut Command) -> Result<(), String> {
@@ -210,9 +262,12 @@ fn parse_device(output: &str) -> Device {
                 device.free_kb = free.parse().unwrap_or(0);
             }
             ["koreader", version] => device.koreader = version.trim().to_string(),
-            ["book", file, size, modified, progress] if is_book(Path::new(file)) => {
+            ["folder", path] => device.folders.push(path.to_string()),
+            ["book", path, size, modified, progress] if is_book(Path::new(path)) => {
+                let (folder, file) = path.rsplit_once('/').unwrap_or(("", path));
                 let (title, author) = title_and_author(file);
                 device.books.push(Book {
+                    folder: folder.to_string(),
                     file: file.to_string(),
                     title,
                     author,
@@ -228,6 +283,7 @@ fn parse_device(output: &str) -> Device {
         }
     }
     device.books.sort_by_key(|book| std::cmp::Reverse(book.modified));
+    device.folders.sort_by_key(|folder| folder.to_lowercase());
     device
 }
 
@@ -404,7 +460,9 @@ impl KoDrop {
         cc.egui_ctx.set_theme(egui::Theme::Light);
         let (messages_tx, messages) = channel();
         let mut app = Self {
-            host: load_host(),
+            host: load_setting("host"),
+            folder: load_setting("folder"),
+            new_folder: None,
             items: Vec::new(),
             device: None,
             connection: Connection::Connecting,
@@ -438,6 +496,30 @@ impl KoDrop {
         });
     }
 
+    fn visible_books(&self) -> Vec<&Book> {
+        self.device
+            .iter()
+            .flat_map(|d| d.books.iter())
+            .filter(|book| book.folder == self.folder)
+            .collect()
+    }
+
+    fn select_folder(&mut self, folder: String) {
+        save_setting("folder", &folder);
+        self.folder = folder;
+    }
+
+    fn start_create_folder(&mut self, name: String, ctx: &egui::Context) {
+        let host = self.host.trim().to_string();
+        let tx = self.messages_tx.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let result = create_folder(&host, &name);
+            let _ = tx.send(Message::FolderCreated(name, result));
+            ctx.request_repaint();
+        });
+    }
+
     // Blocks this thread while the picker is open, sends already running keep going on their own
     fn open_picker(&mut self, ctx: &egui::Context) {
         let picked = rfd::FileDialog::new()
@@ -455,6 +537,7 @@ impl KoDrop {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
         let host = self.host.trim().to_string();
+        let folder = self.folder.clone();
 
         let refused = if host.is_empty() {
             Some("Enter your Kindle's IP address first")
@@ -466,6 +549,7 @@ impl KoDrop {
         if let Some(reason) = refused {
             self.items.push(Item {
                 name,
+                folder,
                 status: Status::Failed(reason.to_string()),
             });
             return;
@@ -474,12 +558,13 @@ impl KoDrop {
         let index = self.items.len();
         self.items.push(Item {
             name,
+            folder: folder.clone(),
             status: Status::Sending,
         });
         let tx = self.messages_tx.clone();
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let status = match send(&path, &host) {
+            let status = match send(&path, &host, &folder) {
                 Ok(()) => Status::Sent,
                 Err(e) => Status::Failed(e),
             };
@@ -502,6 +587,11 @@ impl KoDrop {
                     self.refreshing = false;
                     match result {
                         Ok(device) => {
+                            // A queued refresh means this list may predate a folder just created
+                            let gone = !self.folder.is_empty() && !device.folders.contains(&self.folder);
+                            if gone && !self.refresh_again {
+                                self.select_folder(String::new());
+                            }
                             self.device = Some(device);
                             self.connection = Connection::Connected;
                         }
@@ -511,6 +601,23 @@ impl KoDrop {
                         self.refresh(ctx);
                     }
                 }
+                Message::FolderCreated(name, result) => match result {
+                    Ok(()) => {
+                        if let Some(device) = &mut self.device
+                            && !device.folders.contains(&name)
+                        {
+                            device.folders.push(name.clone());
+                            device.folders.sort_by_key(|folder| folder.to_lowercase());
+                        }
+                        self.select_folder(name);
+                        self.refresh(ctx);
+                    }
+                    Err(reason) => self.items.push(Item {
+                        name,
+                        folder: String::new(),
+                        status: Status::Failed(reason),
+                    }),
+                },
             }
         }
     }
@@ -526,7 +633,8 @@ impl KoDrop {
             .as_ref()
             .and_then(|d| d.battery)
             .map_or(String::new(), |b| format!("{b}%"));
-        painter.text(inner.left_top(), egui::Align2::LEFT_TOP, "books", mono(10.0), INK);
+        let leaf = folder_label(&self.folder).rsplit('/').next().unwrap_or("books");
+        draw_text(painter, inner.left_top(), leaf, mono(10.0), INK, inner.width() - 32.0, 1);
         draw_right_aligned(painter, inner.right_top(), &battery, mono(10.0), INK);
         let mut y = inner.top() + 17.0;
         painter.hline(inner.x_range(), y, Stroke::new(1.0, INK));
@@ -541,8 +649,7 @@ impl KoDrop {
             y += height + 7.0;
         }
 
-        let titles = self.device.iter().flat_map(|d| d.books.iter());
-        for book in titles {
+        for book in self.visible_books() {
             if y + 15.0 > inner.bottom() {
                 break;
             }
@@ -625,7 +732,7 @@ impl KoDrop {
             .inner
             .on_hover_text("Your Kindle's IP address");
         if response.changed() {
-            save_host(self.host.trim());
+            save_setting("host", self.host.trim());
         }
         if response.lost_focus() {
             let ctx = ui.ctx().clone();
@@ -638,8 +745,8 @@ impl KoDrop {
         let mut y = rect.top();
         for item in self.recent_items() {
             let (dot, text) = match &item.status {
-                Status::Sending => (ACCENT, format!("Sending {}…", item.name)),
-                Status::Sent => (GOOD, format!("Sent {}", item.name)),
+                Status::Sending => (ACCENT, format!("Sending {} to {}…", item.name, folder_label(&item.folder))),
+                Status::Sent => (GOOD, format!("Sent {} to {}", item.name, folder_label(&item.folder))),
                 Status::Failed(reason) => (BAD, format!("{}: {reason}", item.name)),
             };
             painter.circle_filled(pos2(rect.left() + 4.0, y + 9.0), 4.0, dot);
@@ -660,11 +767,11 @@ impl KoDrop {
         let painter = ui.painter_at(rect);
 
         painter.text(inner.left_top(), egui::Align2::LEFT_TOP, "Books", bold(22.0), INK);
-        let count = self.device.as_ref().map_or(0, |d| d.books.len());
+        let count = self.visible_books().len();
         let summary = match (&self.device, count) {
-            (None, _) => "Waiting for your Kindle".to_string(),
-            (_, 1) => "1 on this Kindle".to_string(),
-            _ => format!("{count} on this Kindle"),
+            (None, _) => "Not connected".to_string(),
+            (_, 1) => "1 book".to_string(),
+            _ => format!("{count} books"),
         };
         painter.text(pos2(inner.left() + 76.0, inner.top() + 9.0), egui::Align2::LEFT_TOP, summary, sans(13.0), MUTED);
 
@@ -686,6 +793,10 @@ impl KoDrop {
             let ctx = ui.ctx().clone();
             self.refresh(&ctx);
         }
+
+        let combo_rect = Rect::from_min_size(pos2(button_rect.left() - 152.0, inner.top()), vec2(140.0, 32.0));
+        draw_right_aligned(&painter, pos2(combo_rect.left() - 8.0, inner.top() + 8.0), "Folder", sans(13.0), MUTED);
+        self.draw_folder_menu(ui, combo_rect);
 
         let activity_height = self.recent_items().count() as f32 * 28.0;
         let shelf = Rect::from_min_max(
@@ -711,6 +822,135 @@ impl KoDrop {
         }
     }
 
+    fn draw_folder_menu(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let mut folders = vec![String::new()];
+        folders.extend(self.device.iter().flat_map(|d| d.folders.iter().cloned()));
+        let current = self.folder.clone();
+        let mut picked = None;
+        let mut add_new = false;
+
+        let text_color = if ui.rect_contains_pointer(rect) { ACCENT_DARK } else { INK };
+        let selected = egui::RichText::new(folder_label(&current)).font(sans(13.0)).color(text_color);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            ui.spacing_mut().interact_size.y = rect.height();
+            let visuals = ui.visuals_mut();
+            for (widget, fill, line) in [
+                (&mut visuals.widgets.inactive, FIELD, FIELD_LINE),
+                (&mut visuals.widgets.hovered, Color32::WHITE, ACCENT),
+                (&mut visuals.widgets.active, DROP_GROUND, ACCENT_DARK),
+                (&mut visuals.widgets.open, Color32::WHITE, ACCENT),
+            ] {
+                widget.weak_bg_fill = fill;
+                widget.bg_stroke = Stroke::new(1.0, line);
+                widget.corner_radius = 6.0.into();
+                widget.expansion = 0.0;
+            }
+
+            let combo = egui::ComboBox::from_id_salt("folder")
+                .selected_text(selected)
+                .width(rect.width())
+                .truncate()
+                .show_ui(ui, |ui| {
+                    let visuals = ui.visuals_mut();
+                    visuals.widgets.hovered.weak_bg_fill = DROP_GROUND;
+                    visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+                    visuals.selection.bg_fill = DROP_PRESSED;
+                    visuals.selection.stroke = Stroke::new(1.0, ACCENT_DARK);
+                    for folder in &folders {
+                        let label = egui::RichText::new(folder_label(folder)).font(sans(13.0));
+                        let item = ui
+                            .selectable_label(*folder == current, label)
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if item.clicked() {
+                            picked = Some(folder.clone());
+                        }
+                    }
+                    ui.separator();
+                    let label = egui::RichText::new("New folder…").font(sans(13.0)).color(ACCENT_DARK);
+                    let item = ui
+                        .selectable_label(false, label)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    add_new = item.clicked();
+                });
+            combo.response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        });
+
+        if let Some(folder) = picked {
+            self.select_folder(folder);
+        }
+        if add_new {
+            self.new_folder = Some(String::new());
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn draw_new_folder_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut name) = self.new_folder.take() else { return };
+        let mut create = false;
+        let mut cancel = false;
+
+        let dialog = egui::Modal::new(egui::Id::new("new-folder")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.spacing_mut().item_spacing.y = 10.0;
+            ui.label(egui::RichText::new("New folder").font(bold(17.0)).color(INK));
+            ui.label(egui::RichText::new("It's created inside books on your Kindle").font(sans(13.0)).color(MUTED));
+
+            let visuals = ui.visuals_mut();
+            visuals.extreme_bg_color = FIELD;
+            visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, FIELD_LINE);
+            visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, MUTED);
+            let field = egui::TextEdit::singleline(&mut name)
+                .font(sans(14.0))
+                .desired_width(f32::INFINITY)
+                .margin(vec2(8.0, 7.0))
+                .hint_text("Folder name");
+            ui.add(field).request_focus();
+
+            let check = valid_folder_name(&name);
+            let note = match check {
+                Err(reason) if !name.trim().is_empty() => reason,
+                _ => " ",
+            };
+            ui.label(egui::RichText::new(note).font(sans(12.0)).color(BAD));
+            let valid = check.is_ok();
+            create = valid && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().button_padding = vec2(14.0, 7.0);
+                let visuals = ui.visuals_mut();
+                for (widget, fill) in [
+                    (&mut visuals.widgets.inactive, ACCENT),
+                    (&mut visuals.widgets.hovered, ACCENT_DARK),
+                    (&mut visuals.widgets.active, ACCENT_DARK),
+                ] {
+                    widget.weak_bg_fill = fill;
+                    widget.bg_stroke = Stroke::NONE;
+                    widget.expansion = 0.0;
+                }
+                let label = egui::RichText::new("Create").font(sans(13.0)).color(Color32::WHITE);
+                let button = ui.add_enabled(valid, egui::Button::new(label));
+                create |= button.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+
+                let visuals = ui.visuals_mut();
+                visuals.widgets.inactive.weak_bg_fill = FIELD;
+                visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, FIELD_LINE);
+                visuals.widgets.hovered.weak_bg_fill = Color32::WHITE;
+                visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
+                visuals.widgets.active.weak_bg_fill = DROP_GROUND;
+                visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT_DARK);
+                let label = egui::RichText::new("Cancel").font(sans(13.0)).color(INK);
+                let button = ui.add(egui::Button::new(label));
+                cancel = button.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+            });
+        });
+
+        if create {
+            self.start_create_folder(name.trim().to_string(), ctx);
+        } else if !cancel && !dialog.should_close() {
+            self.new_folder = Some(name);
+        }
+    }
+
     // Returns true when the drop tile is clicked
     fn draw_grid(&self, ui: &mut egui::Ui, width: f32) -> bool {
         const GAP: f32 = 20.0;
@@ -719,8 +959,7 @@ impl KoDrop {
         const MIN_CARD_WIDTH: f32 = 140.0;
         let columns = (((width + GAP) / (MIN_CARD_WIDTH + GAP)).floor() as usize).max(1);
         let card_width = (width - GAP * (columns - 1) as f32) / columns as f32;
-        let empty = Vec::new();
-        let books = self.device.as_ref().map_or(&empty, |d| &d.books);
+        let books = self.visible_books();
 
         let leftover = columns - books.len() % columns;
         let tile_on_new_row = leftover == columns && !books.is_empty();
@@ -824,10 +1063,11 @@ impl KoDrop {
             draw_ghost_cover(&painter, center - vec2(0.0, 100.0), &title, &author);
         }
 
+        let folder = folder_label(&self.folder);
         let detail = match books.as_slice() {
-            [] => "It goes to the books folder".to_string(),
-            [only] => format!("{} goes to the books folder", file_name(only)),
-            many => format!("{} books go to the books folder", many.len()),
+            [] => format!("It goes to the {folder} folder"),
+            [only] => format!("{} goes to the {folder} folder", file_name(only)),
+            many => format!("{} books go to the {folder} folder", many.len()),
         };
         painter.text(center + vec2(0.0, 40.0), egui::Align2::CENTER_CENTER, "Release to send to your Kindle", bold(22.0), ACCENT_DARK);
         draw_centered(&painter, center + vec2(0.0, 66.0), &detail, sans(14.0), MUTED, rect.width() - 80.0);
@@ -884,6 +1124,10 @@ impl eframe::App for KoDrop {
         for path in dropped {
             self.add(path, &ctx);
         }
+
+        // Runs before the menu that opens it, so the click on "New folder…" is over by the
+        // time the dialog first appears. Otherwise that click would count as clicking outside
+        self.draw_new_folder_dialog(&ctx);
 
         let frame = egui::Frame::NONE.fill(GROUND);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
@@ -951,8 +1195,51 @@ mod tests {
 
     #[test]
     fn reports_failure_when_nothing_is_listening() {
-        let error = send(Path::new("/etc/hosts"), "127.0.0.1").unwrap_err();
+        let error = send(Path::new("/etc/hosts"), "127.0.0.1", "").unwrap_err();
         assert!(error.contains("Connection refused"), "{error}");
+    }
+
+    #[test]
+    fn quotes_remote_paths() {
+        assert_eq!(shell_quote("/mnt/us/books/"), "'/mnt/us/books/'");
+        assert_eq!(shell_quote("My Book's; rm -rf x"), "'My Book'\\''s; rm -rf x'");
+        assert_eq!(remote_dir(""), "/mnt/us/books/");
+        assert_eq!(remote_dir("Fiction/Classics"), "/mnt/us/books/Fiction/Classics/");
+    }
+
+    #[test]
+    fn checks_folder_names() {
+        for good in ["Fiction", "Sci-Fi & Fantasy", "Adam's Books", "  Trimmed  "] {
+            assert!(valid_folder_name(good).is_ok(), "{good}");
+        }
+        for bad in ["", "   ", "../x", "a/b", ".hidden", "a:b", "a\\b", "a\nb"] {
+            assert!(valid_folder_name(bad).is_err(), "{bad}");
+        }
+        assert!(valid_folder_name(&"x".repeat(256)).is_err());
+    }
+
+    #[test]
+    fn sorts_books_into_folders() {
+        let output = "folder\tzebra\nfolder\tFiction\nfolder\tFiction/Classics\n\
+            book\tRoot - A.epub\t10\t1\tnone\n\
+            book\tFiction/Middle - B.epub\t10\t2\tnone\n\
+            book\tFiction/Classics/Deep - C.pdf\t10\t3\tnone\n\
+            book\tFiction/notes.lua\t10\t4\tnone\n";
+        let device = parse_device(output);
+        assert_eq!(device.folders, ["Fiction", "Fiction/Classics", "zebra"]);
+        let placed: Vec<(&str, &str)> = device
+            .books
+            .iter()
+            .map(|b| (b.folder.as_str(), b.file.as_str()))
+            .collect();
+        assert_eq!(
+            placed,
+            [
+                ("Fiction/Classics", "Deep - C.pdf"),
+                ("Fiction", "Middle - B.epub"),
+                ("", "Root - A.epub"),
+            ]
+        );
     }
 
     #[test]
